@@ -12,6 +12,7 @@
 #include <libcamera/base/log.h>
 
 #include <string>
+#include <cmath>
 
 
 #include "cam_helper.h"
@@ -75,12 +76,24 @@ CamHelperImxVCCamera::CamHelperImxVCCamera()
 
 uint32_t CamHelperImxVCCamera::gainCode(double gain) const
 {
-	return (uint32_t)gain * 1000;
+	// Convert linear gain to milli-dB: mDb = round(20000 * log10(gain))
+	// Clamp gain to a tiny positive to avoid log10(0)
+
+
+	double g = std::max(gain, 1e-9);
+	long mdb = std::lround(20000.0 * std::log10(g));
+	// Avoid negative underflow into uint32_t
+	if (mdb < 0)
+		mdb = 0;
+	LOG(CamHelperImxVCCamera, Debug) << "Gain:  " << gain 
+				<< " GainCode: " << mdb << " dB";
+	return static_cast<uint32_t>(mdb);
 }
 
 double CamHelperImxVCCamera::gain(uint32_t gainCode) const
 {
-	return gainCode / 1000.0;
+	// Convert milli-dB to linear gain: gain = 10^(mDb/20000)
+	return std::pow(10.0, static_cast<double>(gainCode) / 20000.0);
 }
 
 unsigned int CamHelperImxVCCamera::mistrustFramesModeSwitch() const
