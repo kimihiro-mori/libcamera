@@ -111,49 +111,65 @@ bool CamHelperImxVCCamera::sensorEmbeddedDataPresent() const
 	return false;
 }
 
+using libcamera::utils::Duration;
 std::pair<uint32_t, uint32_t>
-CamHelperImxVCCamera::getBlanking(libcamera::utils::Duration &exposure,
-                                  libcamera::utils::Duration minFrameDuration,
-                                  libcamera::utils::Duration maxFrameDuration) const
+CamHelperImxVCCamera::getBlanking(Duration &exposure,
+                                  Duration minFrameDuration,
+                                  Duration maxFrameDuration) const
 {
-	if(mode_.width > 4000)
-	{
-		auto [vblank, hblank] = CamHelper::getBlanking(exposure, minFrameDuration, maxFrameDuration);
-		return { vblank, hblank };
-	}
-	else
-	{
-			using libcamera::utils::Duration;
-			// force hblank = 0 → lineLength = width pixel clocks
-			Duration lineLength = lineLengthPckToDuration(mode_.width);
-			uint32_t frameLengthMin = minFrameDuration / lineLength;
-			uint32_t frameLengthMax = maxFrameDuration / lineLength;
+    // minFrameDuration == maxFrameDuration
+    static_cast<void>(maxFrameDuration);
 
-			LOG(CamHelperImxVCCamera, Debug) << "Width:  " << mode_.width 
-			<< " Height: " << mode_.height << " LineLength: " << lineLength
-			<< " FrameLengthMin: " << frameLengthMin
-			<< " FrameLengthMax: " << frameLengthMax;
+    // IMX900 (4-lane) base hmax values (hblank = 0)
+	constexpr uint32_t numLanes = 4;
+    struct Entry { uint32_t bitDepth; uint32_t hmaxBase; };
+    static constexpr Entry kImx900_4Lane[] = {
+        {  8, 338 },
+        { 10, 364 },
+        { 12, 610 },
+    };
 
+    const uint32_t bitDepth = mode_.bitdepth;
 
-			// limit exposureLines so we don’t overflow
-			uint32_t exposureLines = std::min<uint32_t>(
-				exposure / lineLength,
-				std::numeric_limits<uint32_t>::max() - frameIntegrationDiff
-			);
+    uint32_t hmaxBase = mode_.width;
+    for (const auto &e : kImx900_4Lane) {
+        if (e.bitDepth == bitDepth) {
+            hmaxBase = e.hmaxBase;
+            break;
+        }
+    }
 
-			uint32_t frameLengthLines = std::clamp<uint32_t>(
-				exposureLines + frameIntegrationDiff, frameLengthMin, frameLengthMax
-			);
+    const uint64_t sensorPixelRate = mode_.pixelRate / (2 * numLanes);
 
-			uint32_t vblank = frameLengthLines - mode_.height;
-			// recalc actual exposure
-			exposure = CamHelper::exposure(exposureLines, lineLength);
-			LOG(CamHelperImxVCCamera, Debug) << "FrameLengthLines: " << frameLengthLines 
-			<< " VBlank: " << vblank << " Exposure: " << exposure
-			<< " ExposureLines: " << exposureLines;
-			return { vblank, 0 };
-	}
-   
+    Duration lineLength = mode_.minLineLength;
+    uint32_t frameLengthLines = minFrameDuration / mode_.minLineLength;
+
+    if (frameLengthLines > mode_.maxFrameLength) {
+        Duration lineLengthAdjusted = lineLength * frameLengthLines / mode_.maxFrameLength;
+        lineLength = std::min(mode_.maxLineLength, lineLengthAdjusted);
+        frameLengthLines = mode_.maxFrameLength;
+    }
+
+    const uint64_t lineNs = lineLength.get<std::nano>();
+    const uint32_t hmaxOverwrite =
+        static_cast<uint32_t>((lineNs * sensorPixelRate) / 1000000000ULL);
+
+    const uint32_t hblank =
+        (hmaxOverwrite > hmaxBase)
+            ? (hmaxOverwrite - hmaxBase) * numLanes
+            : 0;
+
+    const uint32_t vblank =
+        (frameLengthLines > mode_.height)
+            ? (frameLengthLines - mode_.height)
+            : 0;
+
+    const uint32_t exposureLines =
+        std::min(frameLengthLines - frameIntegrationDiff,
+                 CamHelper::exposureLines(exposure, lineLength));
+    exposure = CamHelper::exposure(exposureLines, lineLength);
+
+    return { vblank, hblank };
 }
 
 static CamHelper *create()
