@@ -788,6 +788,13 @@ public:
 		 * A larger number will increase latency for 3A changes.
 		 */
 		unsigned int numCfeConfigQueue;
+		/*
+		 * Minimum number of internal CFE Output0 buffers to allocate
+		 * when no raw stream is configured (--no-raw). A larger number
+		 * prevents frame drops at high frame rates by giving the CFE
+		 * enough headroom while the ISP/Backend processes frames.
+		 */
+		unsigned int minCfeOutputBuffers;
 		/* Don't use BE temporal denoise and free some memory resources. */
 		bool disableTdn;
 		/* Don't use BE HDR and free some memory resources. */
@@ -984,16 +991,26 @@ int PipelineHandlerPiSP::prepareBuffers(Camera *camera)
 			 * additional buffers to make up the minimum, but ensure
 			 * we have at least 2 sets of internal buffers to use to
 			 * minimise frame drops.
+			 *
+			 * When no RAW stream is configured (--no-raw), use the
+			 * configurable minCfeOutputBuffers to provide enough
+			 * headroom at high frame rates.
 			 */
-			numBuffers = std::max<int>(2, minBuffers - numRawBuffers);
+			if (numRawBuffers == 0)
+				numBuffers = data->config_.minCfeOutputBuffers;
+			else
+				numBuffers = std::max<int>(2, minBuffers - numRawBuffers);
 		} else if (stream == &data->isp_[Isp::Input]) {
 			/*
 			 * ISP input buffers are imported from the CFE, so follow
 			 * similar logic as above to count all the RAW buffers
 			 * available.
 			 */
-			numBuffers = numRawBuffers +
-					std::max<int>(2, minBuffers - numRawBuffers);
+			if (numRawBuffers == 0)
+				numBuffers = data->config_.minCfeOutputBuffers;
+			else
+				numBuffers = numRawBuffers +
+						std::max<int>(2, minBuffers - numRawBuffers);
 		} else if (stream == &data->cfe_[Cfe::Embedded]) {
 			/*
 			 * Embedded data buffers are (currently) for internal use,
@@ -1336,6 +1353,7 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 	config_ = {
 		.numCfeConfigStatsBuffers = 12,
 		.numCfeConfigQueue = 2,
+		.minCfeOutputBuffers = 4,
 		.disableTdn = false,
 		.disableHdr = false,
 	};
@@ -1361,6 +1379,8 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 		phConfig["num_cfe_config_stats_buffers"].get<unsigned int>(config_.numCfeConfigStatsBuffers);
 	config_.numCfeConfigQueue =
 		phConfig["num_cfe_config_queue"].get<unsigned int>(config_.numCfeConfigQueue);
+	config_.minCfeOutputBuffers =
+		phConfig["min_cfe_output_buffers"].get<unsigned int>(config_.minCfeOutputBuffers);
 	config_.disableTdn = phConfig["disable_tdn"].get<bool>(config_.disableTdn);
 	config_.disableHdr = phConfig["disable_hdr"].get<bool>(config_.disableHdr);
 
@@ -1389,6 +1409,12 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 	if (config_.numCfeConfigQueue < 1) {
 		LOG(RPI, Error)
 			<< "Invalid configuration: numCfeConfigQueue must be >= 1";
+		return -EINVAL;
+	}
+
+	if (config_.minCfeOutputBuffers < 2) {
+		LOG(RPI, Error)
+			<< "Invalid configuration: min_cfe_output_buffers must be >= 2";
 		return -EINVAL;
 	}
 
