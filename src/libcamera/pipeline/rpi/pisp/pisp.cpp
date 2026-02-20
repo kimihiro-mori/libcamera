@@ -2360,7 +2360,7 @@ void PiSPCameraData::tryRunPipeline()
 
 	auto now = steady_clock::now();
 	if (now - last > seconds(5)) {
-		LOG(RPI, Error) << "Pipeline stats (5s):"
+		LOG(RPI, Info) << "Pipeline stats (5s):"
 						<< " state=" << static_cast<int>(state_)
 						<< " requestQueue=" << requestQueue_.size()
 						<< " cfeJobQueue=" << cfeJobQueue_.size()
