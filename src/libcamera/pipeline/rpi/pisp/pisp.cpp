@@ -795,6 +795,14 @@ public:
 		 * enough headroom while the ISP/Backend processes frames.
 		 */
 		unsigned int minCfeOutputBuffers;
+		/*
+		 * Disable PiSP1 compression on CFE output when no raw
+		 * stream is configured.  At high frame rates the
+		 * compression/decompression round-trip through the ISP
+		 * Backend can cause frame drops.  Setting this true selects
+		 * uncompressed 16-bit output (RG16) instead of PC1R.
+		 */
+		bool disableCfeCompression;
 		/* Don't use BE temporal denoise and free some memory resources. */
 		bool disableTdn;
 		/* Don't use BE HDR and free some memory resources. */
@@ -1354,6 +1362,7 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 		.numCfeConfigStatsBuffers = 12,
 		.numCfeConfigQueue = 2,
 		.minCfeOutputBuffers = 4,
+		.disableCfeCompression = false,
 		.disableTdn = false,
 		.disableHdr = false,
 	};
@@ -1381,6 +1390,8 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 		phConfig["num_cfe_config_queue"].get<unsigned int>(config_.numCfeConfigQueue);
 	config_.minCfeOutputBuffers =
 		phConfig["min_cfe_output_buffers"].get<unsigned int>(config_.minCfeOutputBuffers);
+	config_.disableCfeCompression =
+		phConfig["disable_cfe_compression"].get<bool>(config_.disableCfeCompression);
 	config_.disableTdn = phConfig["disable_tdn"].get<bool>(config_.disableTdn);
 	config_.disableHdr = phConfig["disable_hdr"].get<bool>(config_.disableHdr);
 
@@ -1388,7 +1399,7 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 		LOG(RPI, Info) << "TDN disabled by user config";
 		streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
 			       [this] (const RPi::Stream *s) { return s == &isp_[Isp::TdnInput] ||
-								      s == &isp_[Isp::TdnInput]; }),
+								      s == &isp_[Isp::TdnOutput]; }),
 			       streams_.end());
 	}
 
@@ -1462,9 +1473,12 @@ int PiSPCameraData::platformConfigure(const RPi::RPiCameraConfiguration *rpiConf
 		 */
 		V4L2SubdeviceFormat sensorFormatMod = rpiConfig->sensorFormat_;
 		sensorFormatMod.code = mbusCodeUnpacked16(sensorFormatMod.code);
+		BayerFormat::Packing packing = config_.disableCfeCompression
+						  ? BayerFormat::Packing::None
+						  : BayerFormat::Packing::PISP1;
 		cfeFormat = RPi::PipelineHandlerBase::toV4L2DeviceFormat(cfe,
 									 sensorFormatMod,
-									 BayerFormat::Packing::PISP1);
+									 packing);
 		computeOptimalStride(cfeFormat);
 	} else {
 		rawStreams[0].cfg->setStream(&cfe_[Cfe::Output0]);
@@ -2335,6 +2349,27 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 
 void PiSPCameraData::tryRunPipeline()
 {
+	using namespace std::chrono;
+
+	static steady_clock::time_point last = steady_clock::now();
+	static size_t max_cfe = 0;
+	static size_t max_req = 0;
+
+	max_cfe = std::max(max_cfe, cfeJobQueue_.size());
+	max_req = std::max(max_req, requestQueue_.size());
+
+	auto now = steady_clock::now();
+	if (now - last > seconds(5)) {
+		LOG(RPI, Error) << "Pipeline stats (5s):"
+						<< " state=" << static_cast<int>(state_)
+						<< " requestQueue=" << requestQueue_.size()
+						<< " cfeJobQueue=" << cfeJobQueue_.size()
+						<< " peakRequest=" << max_req
+						<< " peakCfe=" << max_cfe;
+		max_req = max_cfe = 0;
+		last = now;
+	}
+
 	/* If any of our request or buffer queues are empty, we cannot proceed. */
 	if (state_ != State::Idle || requestQueue_.empty() || !cfeJobComplete())
 		return;
