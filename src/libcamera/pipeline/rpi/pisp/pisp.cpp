@@ -856,6 +856,10 @@ private:
 				job.buffers.count(&cfe_[Cfe::Embedded]));
 	}
 
+	/* CFE frame-gap diagnostics (written in cfeBufferDequeue) */
+	uint64_t lastCfeTs_ = 0;
+	uint32_t lastCfeSeq_ = 0;
+
 	std::string last_dump_file_;
 };
 
@@ -1756,6 +1760,76 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 	job.buffers[stream] = buffer;
 
 	if (stream == &cfe_[Cfe::Output0]) {
+		/*
+		 * Detect and classify gaps in CFE frame arrival.
+		 *
+		 * The CFE (V4L2) driver only increments the sequence counter
+		 * when a frame is successfully captured into a DMA buffer.
+		 * When no buffer is available, the frame is silently dropped
+		 * and the sequence does NOT advance.  Therefore seqGap alone
+		 * cannot distinguish trigger absence from buffer starvation.
+		 *
+		 * We use the pipeline state and queue depths instead:
+		 *
+		 *   reqQ is near-full (>= totalCfeBufs)
+		 *       → PIPELINE STALL: the ISP/encoder couldn't keep up,
+		 *         CFE ran out of DMA buffers, frames were dropped at
+		 *         hardware level.
+		 *
+		 *   reqQ is low / pipeline was Idle
+		 *       → FRAME DROP: the pipeline was ready and had buffers
+		 *         available, but the inter-frame interval exceeded the
+		 *         expected period.  The frame was lost somewhere in the
+		 *         sensor/CSI-2/CFE chain (not buffer starvation).
+		 *         Note: V4L2 sequence only counts captured frames, so
+		 *         seqGap==1 does NOT mean "no drop"—use the timestamp
+		 *         gap to determine the number of missed frames.
+		 */
+		{
+			uint64_t ts = buffer->metadata().timestamp; /* ns */
+			uint32_t seq = buffer->metadata().sequence;
+
+			if (lastCfeTs_) {
+				int64_t gapUs = static_cast<int64_t>(ts - lastCfeTs_) / 1000;
+
+				if (gapUs > 15000) {
+					size_t totalCfeBufs = cfe_[Cfe::Output0].getBuffers().size();
+					size_t reqQ = requestQueue_.size();
+					bool pipelineBacked = (reqQ >= totalCfeBufs);
+					uint32_t seqGap = seq - lastCfeSeq_;
+					/* Estimate missed frames from timestamp gap */
+					int64_t expectedUs = (lastCfeTs_) ? 8333 : 0; /* 120fps default */
+					unsigned int missedFrames = (expectedUs > 0)
+						? static_cast<unsigned int>(gapUs / expectedUs + 0.5) - 1
+						: 0;
+
+					if (pipelineBacked) {
+						LOG(RPI, Warning)
+							<< "PIPELINE STALL (frame drop): seq "
+							<< lastCfeSeq_ << "->" << seq
+							<< ", gap " << gapUs << "us"
+							<< " | reqQ=" << reqQ
+							<< " cfeBufs=" << totalCfeBufs
+							<< " state=" << static_cast<int>(state_)
+							<< " -- ISP/encoder backpressure starved CFE of buffers";
+					} else {
+						LOG(RPI, Warning)
+							<< "FRAME DROP: seq "
+							<< lastCfeSeq_ << "->" << seq
+							<< " (+" << seqGap << ")"
+							<< ", gap " << gapUs << "us"
+							<< ", ~" << missedFrames << " frame(s) lost"
+							<< " | reqQ=" << reqQ
+							<< " cfeBufs=" << totalCfeBufs
+							<< " state=" << static_cast<int>(state_)
+							<< " -- frame lost in sensor/CSI chain (buffers were available)";
+					}
+				}
+			}
+			lastCfeTs_ = ts;
+			lastCfeSeq_ = seq;
+		}
+
 		/* Do an endian swap or 14-bit unpacking if needed. */
 		if (stream->getFlags() & StreamFlag::Needs16bitEndianSwap ||
 		    stream->getFlags() & StreamFlag::Needs14bitUnpack) {
@@ -2349,27 +2423,6 @@ void PiSPCameraData::prepareBe(uint32_t bufferId, bool stitchSwapBuffers)
 
 void PiSPCameraData::tryRunPipeline()
 {
-	using namespace std::chrono;
-
-	static steady_clock::time_point last = steady_clock::now();
-	static size_t max_cfe = 0;
-	static size_t max_req = 0;
-
-	max_cfe = std::max(max_cfe, cfeJobQueue_.size());
-	max_req = std::max(max_req, requestQueue_.size());
-
-	auto now = steady_clock::now();
-	if (now - last > seconds(5)) {
-		LOG(RPI, Info) << "Pipeline stats (5s):"
-						<< " state=" << static_cast<int>(state_)
-						<< " requestQueue=" << requestQueue_.size()
-						<< " cfeJobQueue=" << cfeJobQueue_.size()
-						<< " peakRequest=" << max_req
-						<< " peakCfe=" << max_cfe;
-		max_req = max_cfe = 0;
-		last = now;
-	}
-
 	/* If any of our request or buffer queues are empty, we cannot proceed. */
 	if (state_ != State::Idle || requestQueue_.empty() || !cfeJobComplete())
 		return;
