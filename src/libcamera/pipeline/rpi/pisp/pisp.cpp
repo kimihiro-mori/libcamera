@@ -856,9 +856,10 @@ private:
 				job.buffers.count(&cfe_[Cfe::Embedded]));
 	}
 
-	/* CFE frame-gap diagnostics (written in cfeBufferDequeue) */
+	/* Buffer diagnostics state */
 	uint64_t lastCfeTs_ = 0;
 	uint32_t lastCfeSeq_ = 0;
+	int64_t cfeAvgIntervalUs_ = 0;
 
 	std::string last_dump_file_;
 };
@@ -1761,71 +1762,39 @@ void PiSPCameraData::cfeBufferDequeue(FrameBuffer *buffer)
 
 	if (stream == &cfe_[Cfe::Output0]) {
 		/*
-		 * Detect and classify gaps in CFE frame arrival.
-		 *
-		 * The CFE (V4L2) driver only increments the sequence counter
-		 * when a frame is successfully captured into a DMA buffer.
-		 * When no buffer is available, the frame is silently dropped
-		 * and the sequence does NOT advance.  Therefore seqGap alone
-		 * cannot distinguish trigger absence from buffer starvation.
-		 *
-		 * We use the pipeline state and queue depths instead:
-		 *
-		 *   reqQ is near-full (>= totalCfeBufs)
-		 *       → PIPELINE STALL: the ISP/encoder couldn't keep up,
-		 *         CFE ran out of DMA buffers, frames were dropped at
-		 *         hardware level.
-		 *
-		 *   reqQ is low / pipeline was Idle
-		 *       → FRAME DROP: the pipeline was ready and had buffers
-		 *         available, but the inter-frame interval exceeded the
-		 *         expected period.  The frame was lost somewhere in the
-		 *         sensor/CSI-2/CFE chain (not buffer starvation).
-		 *         Note: V4L2 sequence only counts captured frames, so
-		 *         seqGap==1 does NOT mean "no drop"—use the timestamp
-		 *         gap to determine the number of missed frames.
+		 * Event-driven buffer diagnostics: log buffer state
+		 * immediately when a frame gap is detected (sequence skip
+		 * or timestamp gap > 1.5× the measured average interval).
 		 */
 		{
 			uint64_t ts = buffer->metadata().timestamp; /* ns */
 			uint32_t seq = buffer->metadata().sequence;
 
-			if (lastCfeTs_) {
+			if (lastCfeTs_ && lastCfeSeq_) {
+				uint32_t seqGap = seq - lastCfeSeq_;
 				int64_t gapUs = static_cast<int64_t>(ts - lastCfeTs_) / 1000;
-
-				if (gapUs > 15000) {
-					size_t totalCfeBufs = cfe_[Cfe::Output0].getBuffers().size();
-					size_t reqQ = requestQueue_.size();
-					bool pipelineBacked = (reqQ >= totalCfeBufs);
-					uint32_t seqGap = seq - lastCfeSeq_;
-					/* Estimate missed frames from timestamp gap */
-					int64_t expectedUs = (lastCfeTs_) ? 8333 : 0; /* 120fps default */
-					unsigned int missedFrames = (expectedUs > 0)
-						? static_cast<unsigned int>(gapUs / expectedUs + 0.5) - 1
-						: 0;
-
-					if (pipelineBacked) {
-						LOG(RPI, Warning)
-							<< "PIPELINE STALL (frame drop): seq "
-							<< lastCfeSeq_ << "->" << seq
-							<< ", gap " << gapUs << "us"
-							<< " | reqQ=" << reqQ
-							<< " cfeBufs=" << totalCfeBufs
-							<< " state=" << static_cast<int>(state_)
-							<< " -- ISP/encoder backpressure starved CFE of buffers";
-					} else {
-						LOG(RPI, Warning)
-							<< "FRAME DROP: seq "
-							<< lastCfeSeq_ << "->" << seq
-							<< " (+" << seqGap << ")"
-							<< ", gap " << gapUs << "us"
-							<< ", ~" << missedFrames << " frame(s) lost"
-							<< " | reqQ=" << reqQ
-							<< " cfeBufs=" << totalCfeBufs
-							<< " state=" << static_cast<int>(state_)
-							<< " -- frame lost in sensor/CSI chain (buffers were available)";
-					}
+				if (seqGap > 1 || (cfeAvgIntervalUs_ > 0 && gapUs > cfeAvgIntervalUs_ * 3 / 2)) {
+					LOG(RPI, Info)
+						<< "[FrameGap] seq " << lastCfeSeq_ << "->" << seq
+						<< " (+" << seqGap << ")"
+						<< " gap=" << gapUs << "us"
+						<< " avgInterval=" << cfeAvgIntervalUs_ << "us"
+						<< " | CFE total=" << cfe_[Cfe::Output0].getBuffers().size()
+						<< " avail=" << cfe_[Cfe::Output0].numAvailableBuffers()
+						<< " | ISP-out0 total=" << isp_[Isp::Output0].getBuffers().size()
+						<< " avail=" << isp_[Isp::Output0].numAvailableBuffers()
+						<< " | reqQ=" << requestQueue_.size()
+						<< " state=" << static_cast<int>(state_);
+				}
+				/* Update running average of frame interval (EMA, alpha ~1/64) */
+				if (seqGap == 1) {
+					if (cfeAvgIntervalUs_ == 0)
+						cfeAvgIntervalUs_ = gapUs;
+					else
+						cfeAvgIntervalUs_ = (cfeAvgIntervalUs_ * 63 + gapUs) / 64;
 				}
 			}
+
 			lastCfeTs_ = ts;
 			lastCfeSeq_ = seq;
 		}

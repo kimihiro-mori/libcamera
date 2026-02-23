@@ -135,6 +135,8 @@ public:
 	int queueAllBuffers();
 	void releaseBuffers();
 
+	unsigned int numAvailableBuffers() const { return availableBuffers_.size(); }
+
 	/* For error handling. */
 	static const BufferObject errorBufferObject;
 
