@@ -1374,7 +1374,7 @@ int PiSPCameraData::platformPipelineConfigure(const std::unique_ptr<YamlObject> 
 		LOG(RPI, Info) << "TDN disabled by user config";
 		streams_.erase(std::remove_if(streams_.begin(), streams_.end(),
 			       [this] (const RPi::Stream *s) { return s == &isp_[Isp::TdnInput] ||
-								      s == &isp_[Isp::TdnInput]; }),
+								      s == &isp_[Isp::TdnOutput]; }),
 			       streams_.end());
 	}
 
